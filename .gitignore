@@ -10,3 +10,6 @@
 *.zip
 *.dmg
 dist/
+
+# Local launcher
+/start.sh

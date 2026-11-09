@@ -35,15 +35,19 @@ public enum F50MobileDataError: LocalizedError {
 
 @MainActor
 public class F50Fetcher: ObservableObject {
-    private let session: URLSession = {
+    private static func makeSession() -> URLSession {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 4.0
         config.timeoutIntervalForResource = 8.0
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         return URLSession(configuration: config, delegate: F50NetworkDelegate.shared, delegateQueue: nil)
-    }()
+    }
+    private let session: URLSession
+    private let savePassword: (String) -> Void
 
     @Published public var status: F50Status = F50Status()
+    @Published public private(set) var networkMode: F50NetworkMode?
+    @Published public private(set) var isSwitchingNetworkMode = false
     @Published public var baseURLString: String {
         didSet {
             if baseURLString != oldValue {
@@ -61,7 +65,7 @@ public class F50Fetcher: ObservableObject {
     @Published public var password: String {
         didSet {
             if password != oldValue {
-                KeychainCredentialStore.save(password, account: "router-password")
+                savePassword(password)
                 if !isApplyingConfiguration { configurationDidChange() }
             }
         }
@@ -166,13 +170,26 @@ public class F50Fetcher: ObservableObject {
         self.status.trafficResetDay = effectiveDay
     }
 
-    public init() {
+    public convenience init() {
+        self.init(session: Self.makeSession(), automaticallyRefresh: true, loadPassword: {
+            KeychainCredentialStore.loadMigratingLegacyValue(
+                account: "router-password",
+                legacyDefaultsKey: F50Configuration.legacyPasswordDefaultsKey,
+                fallback: ""
+            )
+        }, savePassword: { value in
+            KeychainCredentialStore.save(value, account: "router-password")
+        })
+    }
+
+    /// 内部依赖注入用于隔离网络和钥匙串的回归测试。
+    init(session: URLSession, automaticallyRefresh: Bool,
+         loadPassword: @escaping () -> String, savePassword: @escaping (String) -> Void) {
+        self.session = session
+        self.savePassword = savePassword
         self.baseURLString = UserDefaults.standard.string(forKey: F50Configuration.baseURLDefaultsKey)
             ?? F50Configuration.defaultBaseURL
-        self.password = KeychainCredentialStore.loadMigratingLegacyValue(
-            account: "router-password",
-            legacyDefaultsKey: F50Configuration.legacyPasswordDefaultsKey
-        )
+        self.password = loadPassword()
 
         let savedInterval = UserDefaults.standard.double(forKey: F50Configuration.refreshIntervalDefaultsKey)
         self.refreshInterval = savedInterval > 0 ? savedInterval : F50Configuration.defaultRefreshInterval
@@ -201,18 +218,22 @@ public class F50Fetcher: ObservableObject {
         }
 
         if self.isDemoMode {
+            self.networkMode = .automatic
             self.status = F50Status.mockStatus(tick: 0)
             self.smsMessages = F50SMSMessage.mockMessages
             self.status.smsUnreadCount = self.smsMessages.filter { $0.isUnread }.count
         }
 
         updateEffectiveTrafficResetDay()
-        startTimer()
-        fetchData()
-        fetchSMSMessages()
+        if automaticallyRefresh {
+            startTimer()
+            fetchData()
+            fetchSMSMessages()
+        }
     }
 
     public func applyDemoData() {
+        networkMode = .automatic
         self.status = F50Status.mockStatus(tick: demoTick)
         if !demoMobileDataOn { self.status.rawPppStatus = "ppp_disconnected" }
         self.smsMessages = F50SMSMessage.mockMessages
@@ -394,7 +415,9 @@ public class F50Fetcher: ObservableObject {
 
     /// 开关蜂窝数据（CONNECT_NETWORK / DISCONNECT_NETWORK）。UI 以轮询到的 ppp_status 为准，不做本地乐观更新。
     public func setMobileData(enabled: Bool) async throws {
-        guard !isSwitchingMobileData else { return }
+        guard !isSwitchingMobileData, !isSwitchingNetworkMode else {
+            throw F50NetworkModeError.busy
+        }
 
         if isDemoMode {
             demoMobileDataOn = enabled
@@ -422,6 +445,47 @@ public class F50Fetcher: ObservableObject {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
             await fetchDataAsync()
         }
+    }
+
+    /// 通过原厂后台切换模式；回读配置确认，不把实际驻网类型当作配置。
+    public func setNetworkMode(_ mode: F50NetworkMode) async throws {
+        guard !isSwitchingNetworkMode, !isSwitchingMobileData,
+              !status.isMobileDataTransitioning else { throw F50NetworkModeError.busy }
+        if isDemoMode {
+            networkMode = mode
+            return
+        }
+        guard status.isOnline, networkMode != nil else { throw F50NetworkModeError.unavailable }
+        guard mode != networkMode else { return }
+        guard !password.isEmpty else { throw F50MobileDataError.missingPassword }
+
+        let generation = requestGeneration
+        let routerBaseURL = routerURLString
+        isSwitchingNetworkMode = true
+        defer { isSwitchingNetworkMode = false }
+        let result = await postGoform(generation: generation, body: {
+            F50ResponseParser.buildNetworkModeRequestBody(mode: mode, ad: $0)
+        })
+        guard generation == requestGeneration else { throw CancellationError() }
+        switch result {
+        case .success: break
+        case .loginFailed: throw F50MobileDataError.loginFailed
+        case .failed: throw F50NetworkModeError.requestFailed
+        }
+        appendLog("网络", "已请求切换为\(mode.title)")
+        for attempt in 0..<15 {
+            if attempt > 0 { try await Task.sleep(nanoseconds: 1_000_000_000) }
+            guard generation == requestGeneration else { throw CancellationError() }
+            if let payload = try? await routerCommands("network_net_select", routerBaseURL: routerBaseURL),
+               generation == requestGeneration {
+                networkMode = F50ResponseParser.parseNetworkMode(payload)
+                if networkMode == mode {
+                    await fetchDataAsync()
+                    return
+                }
+            }
+        }
+        throw F50NetworkModeError.notConfirmed
     }
 
     // MARK: - 发送短信
@@ -608,11 +672,14 @@ public class F50Fetcher: ObservableObject {
     private var isLoginRejected = false
 
     /// 登录：LD 挑战值 + 口令哈希。失败的登录会消耗路由器的尝试次数，所以这里宁可不登也不盲目重试。
-    private func login(routerBaseURL: String) async -> Bool {
+    private func login(routerBaseURL: String, generation: UInt) async -> Bool {
+        guard generation == requestGeneration else { return false }
         sessionCookie = nil
         guard !password.isEmpty, !isLoginRejected else { return false }
+        let loginPassword = password
 
         guard let lockState = try? await routerCommands("psw_fail_num_str,login_lock_time", routerBaseURL: routerBaseURL),
+              generation == requestGeneration,
               F50ResponseParser.isLoginAttemptSafe(lockState) else {
             appendLog("错误", "路由器登录已锁定或剩余尝试次数不足，跳过登录")
             return false
@@ -622,18 +689,20 @@ public class F50Fetcher: ObservableObject {
                 routerBaseURL: routerBaseURL,
                 path: "/goform/goform_get_cmd_process?isTest=false&cmd=LD"
               ))?["LD"] as? String, !ld.isEmpty,
+              generation == requestGeneration,
               var request = try? routerRequest(
                 routerBaseURL: routerBaseURL,
                 path: "/goform/goform_set_cmd_process",
                 timeout: 4.0
               ) else { return false }
 
-        let passwordHash = F50ResponseParser.loginPasswordHash(password: password, ld: ld)
+        let passwordHash = F50ResponseParser.loginPasswordHash(password: loginPassword, ld: ld)
         request.httpMethod = "POST"
         request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
         request.httpBody = Data("isTest=false&goformId=LOGIN&password=\(passwordHash)".utf8)
 
-        guard let (data, response) = try? await session.data(for: request) else { return false }
+        guard let (data, response) = try? await session.data(for: request),
+              generation == requestGeneration else { return false }
         guard F50ResponseParser.isLoginSuccess(data) else {
             isLoginRejected = true
             appendLog("错误", "路由器拒绝了登录口令；修改口令前不再重试")
@@ -667,6 +736,7 @@ public class F50Fetcher: ObservableObject {
         func attempt() async -> Bool {
             guard generation == requestGeneration,
                   let ad = await fetchAuthAD(routerBaseURL: routerBaseURL),
+                  generation == requestGeneration,
                   var request = try? routerRequest(
                     routerBaseURL: routerBaseURL,
                     path: "/goform/goform_set_cmd_process",
@@ -676,12 +746,14 @@ public class F50Fetcher: ObservableObject {
             request.setValue("application/x-www-form-urlencoded; charset=UTF-8", forHTTPHeaderField: "Content-Type")
             request.httpBody = Data(body(ad).utf8)
             guard let (data, response) = try? await session.data(for: request),
+                  generation == requestGeneration,
                   (response as? HTTPURLResponse)?.statusCode == 200 else { return false }
             return isSuccess(data)
         }
 
         if sessionCookie != nil, await attempt() { return .success }
-        guard await login(routerBaseURL: routerBaseURL) else { return .loginFailed }
+        guard generation == requestGeneration,
+              await login(routerBaseURL: routerBaseURL, generation: generation) else { return .loginFailed }
         return await attempt() ? .success : .failed
     }
 
@@ -694,7 +766,7 @@ public class F50Fetcher: ObservableObject {
         // 所以这里不显式请求它们，只保留独立数据源 Z5g_rsrp 与其它兑底字段。
         // V50 (MU3351) 会通过 temperature / cpu_temp 返回硬件指标；保留 ic_temp
         // 以兼容 F50 等旧固件。
-        let statusCommands = "usb_port_switch,battery_charging,sms_received_flag,sms_unread_num,sms_sim_unread_num,sim_msisdn,battery_value,battery_vol_percent,network_signalbar,network_rssi,cr_version,iccid,imei,imsi,ipv6_wan_ipaddr,lan_ipaddr,mac_address,msisdn,network_information,Lte_ca_status,rssi,Z5g_rsrp,Z5g_snr,lte_rsrp,wifi_access_sta_num,loginfo,realtime_rx_thrpt,realtime_tx_thrpt,network_type,network_provider,ppp_status,temperature,cpu_temp,internal_temperature,ic_temp,cpu_temperature,cpu_utility,mem_utility,5g_rsrp,5g_rsrq,5g_snr,lte_rsrq,lte_snr,signalbar,qci,ambr,dl_ambr,ul_ambr,network_simcard_roam,simcard_roam,roam_setting_option"
+        let statusCommands = "usb_port_switch,battery_charging,sms_received_flag,sms_unread_num,sms_sim_unread_num,sim_msisdn,battery_value,battery_vol_percent,network_signalbar,network_rssi,cr_version,iccid,imei,imsi,ipv6_wan_ipaddr,lan_ipaddr,mac_address,msisdn,network_information,Lte_ca_status,rssi,Z5g_rsrp,Z5g_snr,lte_rsrp,wifi_access_sta_num,loginfo,realtime_rx_thrpt,realtime_tx_thrpt,network_type,network_net_select,network_provider,ppp_status,temperature,cpu_temp,internal_temperature,ic_temp,cpu_temperature,cpu_utility,mem_utility,5g_rsrp,5g_rsrq,5g_snr,lte_rsrq,lte_snr,signalbar,qci,ambr,dl_ambr,ul_ambr,network_simcard_roam,simcard_roam,roam_setting_option"
         let trafficCommands = "realtime_rx_bytes,realtime_tx_bytes,realtime_time,monthly_tx_bytes,monthly_rx_bytes,monthly_time,day_rx_bytes,day_tx_bytes,total_rx_bytes,total_tx_bytes,data_volume_limit_size,data_volume_limit_unit,data_volume_limit_switch,flux_data_volume_limit_size,flux_data_volume_limit_unit,flux_clear_date,flux_auto_clear_flow_data_switch,data_volume_clear_date,monthly_clear_date,clear_date,data_volume_clear_day,monthly_clear_day,clear_day,data_volume_reset_day,billing_day,traffic_clear_date"
         let cmdList = refreshTraffic ? "\(statusCommands),\(trafficCommands)" : statusCommands
 
@@ -703,7 +775,9 @@ public class F50Fetcher: ObservableObject {
             do {
                 dict = try await routerCommands(cmdList, routerBaseURL: routerBaseURL)
             } catch RouterError.unauthorized(let message) {
-                guard await login(routerBaseURL: routerBaseURL) else { throw RouterError.unauthorized(message) }
+                guard await login(routerBaseURL: routerBaseURL, generation: generation) else {
+                    throw RouterError.unauthorized(message)
+                }
                 dict = try await routerCommands(cmdList, routerBaseURL: routerBaseURL)
             }
         } catch {
@@ -712,6 +786,7 @@ public class F50Fetcher: ObservableObject {
         }
 
         guard generation == requestGeneration else { return }
+        networkMode = F50ResponseParser.parseNetworkMode(dict)
         parseStatusDict(dict, refreshTraffic: refreshTraffic)
         if refreshTraffic {
             lastTrafficRefreshDate = Date()
@@ -740,6 +815,7 @@ public class F50Fetcher: ObservableObject {
 
     private func configurationDidChange() {
         requestGeneration &+= 1
+        networkMode = isDemoMode ? .automatic : nil
         isFetching = false
         isFetchingExtensions = false
         isFetchingSMS = false

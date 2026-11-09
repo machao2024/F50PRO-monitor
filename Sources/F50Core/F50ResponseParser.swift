@@ -316,6 +316,17 @@ enum F50ResponseParser {
         return "isTest=false&goformId=\(goformId)&notCallback=true&AD=\(ad)"
     }
 
+    static func parseNetworkMode(_ dict: [String: Any]) -> F50NetworkMode? {
+        // network_type 是实际驻网类型，不能用于推断已配置的模式。
+        let value = (dict["network_net_select"] as? String)
+            .flatMap { $0.isEmpty ? nil : $0 } ?? (dict["net_select"] as? String)
+        return value.flatMap(F50NetworkMode.init(rawValue:))
+    }
+
+    static func buildNetworkModeRequestBody(mode: F50NetworkMode, ad: String) -> String {
+        "isTest=false&goformId=SET_BEARER_PREFERENCE&BearerPreference=\(mode.rawValue)&AD=\(ad)"
+    }
+
     static func isGoformSetSuccess(_ data: Data) -> Bool {
         guard let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let result = dict["result"] else { return false }

@@ -19,8 +19,10 @@ public enum F50Configuration {
     /// 旧版本已保存过地址的用户无需再次经过首次设置。
     public static var needsInitialSetup: Bool {
         let defaults = UserDefaults.standard
+        let hasSavedPassword = !(KeychainCredentialStore.load(account: "router-password") ?? "").isEmpty
         return !defaults.bool(forKey: initialSetupCompletedDefaultsKey)
             && defaults.object(forKey: baseURLDefaultsKey) == nil
+            && !hasSavedPassword
     }
 
     /// 探测常见 F50 网关地址；仅请求设备公开的只读状态接口，不会发送或修改任何配置。

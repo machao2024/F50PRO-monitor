@@ -55,7 +55,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if F50Configuration.needsInitialSetup {
             showInitialSetup()
         }
-        
+
         // 3. Observe Status & Settings Changes to Update Menu Bar Text
         Publishers.CombineLatest(fetcher.$status, fetcher.$displayMode)
             .receive(on: DispatchQueue.main)

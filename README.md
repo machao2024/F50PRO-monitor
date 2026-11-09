@@ -22,6 +22,7 @@
 - **网络与信号**：运营商、网络制式（5G SA / NSA / 4G LTE）、频段、信号格，RSRP / SINR / RSRQ 及质量评级
 - **漫游状态**：未漫游 / 国内漫游 / 国际漫游，以及路由器上数据漫游开关的状态
 - **移动数据开关**：在面板上直接断开 / 连接蜂窝数据（需填写路由器管理密码）
+- **网络模式快捷切换**：面板提供「仅 4G / 自动 5G」，「更多」中可选 5G SA、5G NSA；选中状态以设备回读配置为准
 - **套餐流量**：读取路由器后台设置的套餐总量，显示已用、剩余、进度条；
   固定流量包（路由器「自动清零」关闭）不会显示误导性的「N 天后重置」
 - **当日流量 / 累计已用**：固件没有当日计数器，应用以本地基线计算当日用量；Mac 跨零点睡眠也不会漏算夜间用量
@@ -98,6 +99,7 @@ F50 Pro 的网页后台不提供这两项指标，面板默认显示 `--`。
 | 写操作鉴权 | 需携带 `AD = SHA256(SHA256(wa_inner_version + cr_version) + RD)`，大小写规则同上 |
 | 登录锁定 | 连续 5 次登录失败会锁定账户 300 秒（`psw_fail_num_str` 为剩余次数，`login_lock_time` 为剩余秒数）。应用在口令被拒后不再重试，且剩余次数 < 3 或已锁定时不尝试登录 |
 | 移动数据开关 | `goformId=CONNECT_NETWORK` / `DISCONNECT_NETWORK`，状态取自 `ppp_status` |
+| 网络模式 | `goformId=SET_BEARER_PREFERENCE`，`BearerPreference`：`Only_LTE`（仅 4G）、`WL_AND_5G`（自动 5G/4G/3G）、`Only_5G`（5G SA）、`LTE_AND_5G`（5G NSA）；回读 `network_net_select`，接口与参数参照 B28 原厂后台脚本 |
 | 套餐总量 | 键名带 `flux_` 前缀：`flux_data_volume_limit_size`（如 `50_1024` = 50 GB） |
 | 清零日 | `flux_clear_date`；仅当 `flux_auto_clear_flow_data_switch` 不为 `off` 时才视为有效 |
 | 漫游 | `network_simcard_roam`：`Home` / `Internal` / `International`；开关为 `roam_setting_option` |
